@@ -6,13 +6,14 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	flapjack "github.com/flapjack/flapjack/src/flapjack"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"time"
+
+	flapjack "github.com/flapjack/flapjack/src/flapjack"
 )
 
 type ApiClient struct {
@@ -26,16 +27,7 @@ func (ac *ApiClient) Cancel() {
 	ac.http.CancelRequest(ac.request)
 }
 
-func (ac *ApiClient) Connect(finished chan<- error) {
-	icinga_url_parts := []string{
-		"https://", ac.config.IcingaServer, "/v1/events?queue=", ac.config.IcingaQueue,
-		"&types=CheckResult&types=StateChange",
-	}
-	var icinga_url bytes.Buffer
-	for i := range icinga_url_parts {
-		icinga_url.WriteString(icinga_url_parts[i])
-	}
-
+func (ac *ApiClient) NewHttpClient() *http.Client {
 	var tls_config *tls.Config
 
 	if ac.config.IcingaCertfile != "" {
@@ -51,9 +43,6 @@ func (ac *ApiClient) Connect(finished chan<- error) {
 		tls_config = &tls.Config{RootCAs: CA_Pool}
 	}
 
-	req, _ := http.NewRequest("POST", icinga_url.String(), nil)
-	req.Header.Add("Accept", "application/json")
-	req.SetBasicAuth(ac.config.IcingaUser, ac.config.IcingaPassword)
 	var tr *http.Transport
 	if tls_config == nil {
 		tr = &http.Transport{
@@ -82,6 +71,29 @@ func (ac *ApiClient) Connect(finished chan<- error) {
 	}
 
 	ac.http = tr
+	return client
+}
+
+func (ac *ApiClient) NewHttpRequest(method string, url string) *http.Request {
+	req, _ := http.NewRequest(method, url, nil)
+	req.Header.Add("Accept", "application/json")
+	req.SetBasicAuth(ac.config.IcingaUser, ac.config.IcingaPassword)
+	return req
+}
+
+func (ac *ApiClient) Connect(finished chan<- error) {
+	icinga_url_parts := []string{
+		"https://", ac.config.IcingaServer, "/v1/events?queue=", ac.config.IcingaQueue,
+		"&types=CheckResult&types=StateChange",
+	}
+	var icinga_url bytes.Buffer
+	for i := range icinga_url_parts {
+		icinga_url.WriteString(icinga_url_parts[i])
+	}
+
+	client := ac.NewHttpClient()
+	req := ac.NewHttpRequest("POST", icinga_url.String())
+
 	ac.request = req
 
 	go func() {
@@ -166,11 +178,42 @@ func (ac *ApiClient) processResponse(resp *http.Response) error {
 			}
 
 			// build and submit Flapjack redis event
+			var varURL string
 			var service string
+			var serviceType string
+			var name string
+
 			if serv, ok := m["service"]; ok {
 				service = serv.(string)
+				serviceType = "services"
+				name = fmt.Sprintf("%s!%s", m["host"], m["service"])
 			} else {
 				service = "HOST"
+				serviceType = "hosts"
+				name = m["host"].(string)
+			}
+
+			varURL = fmt.Sprintf("https://%s/v1/objects/%s/%s", ac.config.IcingaServer, serviceType, name)
+
+			client := ac.NewHttpClient()
+			req := ac.NewHttpRequest("GET", varURL)
+
+			resp, _ = client.Do(req)
+			decoder = json.NewDecoder(resp.Body)
+			err = decoder.Decode(&data)
+			if err != nil {
+				return err
+			}
+
+			extra := data.(map[string]interface{})
+			result := extra["results"].([]interface{})
+			first := result[0].(map[string]interface{})
+			attrs := first["attrs"].(map[string]interface{})
+			vars := attrs["vars"].(map[string]interface{})
+
+			var tags []string
+			if val, ok := vars["tags"]; ok {
+				tags = val.([]string)
 			}
 
 			event := flapjack.Event{
@@ -180,6 +223,8 @@ func (ac *ApiClient) processResponse(resp *http.Response) error {
 				Time:    int64(timestamp),
 				State:   state,
 				Summary: check_result["output"].(string),
+				Details: fmt.Sprintf("tags: %s", tags),
+				Tags:    tags,
 			}
 
 			// TODO handle err better -- e.g. redis down?
